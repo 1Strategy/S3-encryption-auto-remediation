@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Builds AWS resources that checks the encryption status of a newly created S3 bucket.
+  An EventBridge rule is used to trigger a Lambda function, which then automatically adds default
+  encryption to the bucket.
+
+Resources:
+  #----------------------------------
+  # EventBridge
+  #----------------------------------
+
+  CreateBucketEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Identifies S3 bucket creation events
+      State: ENABLED # by default
+      Targets:
+        - Arn: !GetAtt EncryptBucketFunction.Arn
+          Id: TargetEncryptBucketFunction
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - CreateBucket
+
+  #----------------------------------
+  # Lambda
+  #----------------------------------
+  EncryptBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt EncryptBucketFunctionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+
+          def lambda_handler(event, context):
+              """Lambda function triggered by EventBridge rule that detects the
+              creation of an S3 bucket.
+              """
+
+              try:
+                  # gather data from event
+                  curr_region = event['region']
+                  s3 = boto3.client('s3', region_name=curr_region)
+                  detail = event['detail']
+                  bucket_name = detail['requestParameters']['bucketName']
+                  account_id = detail['userIdentity']['accountId']
+
+                  check_encryption_status(bucket_name, s3, account_id, logger)
+
+              except ClientError as e:
+                  logger.info(
+                      f'{e}. Enabling encryption on Bucket {bucket_name}...'
+                      )
+
+                  set_up_encryption(s3, bucket_name, account_id, logger)
+                  check_encryption_status(bucket_name, s3, account_id, logger)
+
+              except Exception as e:
+                  raise e
+
+
+          def check_encryption_status(bucket_name, s3, account_id, logger):
+              response = s3.get_bucket_encryption(
+                  Bucket=bucket_name,
+                  ExpectedBucketOwner=account_id
+                  )
+              logger.info(f'Current encryption status: {response}')
+              return response
+
+
+          def set_up_encryption(s3, bucket_name, account_id, logger):
+              response = s3.put_bucket_encryption(
+                  Bucket=bucket_name,
+                  ServerSideEncryptionConfiguration={
+                      'Rules': [
+                          {
+                              'ApplyServerSideEncryptionByDefault': {
+                                  'SSEAlgorithm': 'AES256'
+                              }
+                          },
+                      ]
+                  },
+                  ExpectedBucketOwner=account_id
+              )
+              return response
+
+  EncryptBucketFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CheckEncryptionStatusAndAddBucketEncryption
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutEncryptionConfiguration
+                Resource: "*"
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EncryptBucketFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt CreateBucketEventRule.Arn
